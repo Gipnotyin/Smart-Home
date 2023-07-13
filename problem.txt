@@ -1,0 +1,152 @@
+import os
+import sys
+import requests
+import base64
+from functools import reduce
+import struct
+
+
+def conrol_summa():
+    CRC8_byte = lambda byte, poly=0x1d: reduce(lambda b, _: b << 1 ^ (b & 0x80 and poly), range(8), byte) & 0xff
+    CRC8_lookup = list(map(CRC8_byte, range(256)))
+    CRC8 = lambda bytes: reduce(lambda c, b: CRC8_lookup[c ^ b], bytes, 0)
+    pack = lambda payload: [len(payload), *payload, CRC8(payload)]
+    b64encode = lambda payload: base64.urlsafe_b64encode(bytearray(pack(payload))).decode('ascii').rstrip('=')
+    address = int(sys.argv[2])
+
+    varuint_address = []
+    while True:
+        byte = address & 0x7F
+        address >>= 7
+        if address:
+            byte |= 0x80
+            varuint_address.append(byte)
+        if not address:
+            break
+
+    varuint_address.reverse()
+    payload = \
+        [
+            0b10001001, 0b00000110,  # адрес отправителя = 777
+            0b11111111, 0b01111111,  # адрес получателя  = 0x3FFF (всем)
+            0b00000001,  # serial (номер пакета)
+            0b00000001,  # dev_type = 1 (хаб)
+            0b00000001,  # cmd = 1 (WHOISHERE)
+
+            # cmd_body:
+            1, 88,  # dev_name = XXX - имя хоста, длина + массив байт
+            # dev_props = [], длина + массив байт (если не пустой)
+        ]
+    #payload[0:1] = varuint_address
+    print(payload)
+    return b64encode(payload)
+
+
+def Encode(data):
+    return base64.urlsafe_b64decode(data + '=' * (4 - len(data) % 4))
+
+
+# Функция для вычисления контрольной суммы CRC-8
+def crc8(data):
+    crc = 0
+    for byte in data:
+        crc ^= byte
+        for _ in range(8):
+            if crc & 0x80:
+                crc = (crc << 1) ^ 0x31  # Полином CRC-8 (0x31)
+            else:
+                crc <<= 1
+    print(crc & 0xFF)
+    return crc & 0xFF
+
+
+# Функция для декодирования ULEB128
+def decode_varuint(data):
+    value = 0
+    shift = 0
+    size = 0
+    for byte in data:
+        value |= (byte & 0x7F) << shift
+        shift += 7
+        size += 1
+        if not (byte & 0x80):
+            break
+    return value, size
+
+
+def decode_packet(packet_data):
+    packet_size = packet_data[0]
+    print(packet_size)
+    payload_field = packet_data[1:-1]
+    src8 = packet_data[-1]
+    print('src8', src8)
+
+    # Проверяем контрольную сумму CRC-8
+    if crc8(packet_data[:-1]) != src8:
+        # Контрольная сумма не совпадает, возвращаем None
+        return None
+
+    # Разбираем поле payload
+    payload_size = payload_field[0]
+    payload = payload_field[1:payload_size + 1]
+
+    # Разбираем payload
+    varuint_address, address_size = decode_varuint(payload)
+    dst = struct.unpack('H', payload[address_size:address_size + 2])[0]
+    serial, serial_size = decode_varuint(payload[address_size + 2:])
+    dev_type = payload[address_size + 2 + serial_size]
+    cmd = payload[address_size + 2 + serial_size + 1]
+    cmd_body = base64.urlsafe_b64decode(payload[address_size + 2 + serial_size + 2:])
+
+    # Формируем декодированный пакет
+    decoded_packet = {
+        'src': varuint_address,
+        'dst': dst,
+        'serial': serial,
+        'dev_type': dev_type,
+        'cmd': cmd,
+        'cmd_body': cmd_body
+    }
+    return decoded_packet
+
+
+def dec_data(encoded_packet):
+    packet_data = encoded_packet
+    # Расшифровываем пакет
+    decoded_packet = decode_packet(packet_data)
+    if decoded_packet is not None:
+        # Получаем значения полей пакета
+        src = decoded_packet['src']
+        dst = decoded_packet['dst']
+        serial = decoded_packet['serial']
+        dev_type = decoded_packet['dev_type']
+        cmd = decoded_packet['cmd']
+        cmd_body = decoded_packet['cmd_body']
+
+        # Обрабатываем поля пакета
+        print("Расшифрованный пакет:")
+        print(f"src: {src}")
+        print(f"dst: {dst}")
+        print(f"serial: {serial}")
+        print(f"dev_type: {dev_type}")
+        print(f"cmd: {cmd}")
+        print(f"cmd_body: {cmd_body}")
+    else:
+        print("Ошибка при декодировании пакета")
+
+
+def main():
+    url, address = sys.argv[1:]
+    decode = conrol_summa()
+    response = requests.post(url, decode)
+    dec_data(Encode(decode))
+    if response.status_code == 200:
+        #dec_data(Encode(response.text))
+        print()
+    else:
+        print('popusk')
+
+
+if __name__ == '__main__':
+    main()
+
