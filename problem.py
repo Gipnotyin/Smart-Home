@@ -62,25 +62,6 @@ def read_uleb128(value: BytesIO):
     return result
 
 
-def name_struct(byte_str: bytes):
-    len_bytes = []
-    i = 0
-    while True:
-        b = byte_str[i]
-        len_bytes.append(b & 0x7f)
-        i += 1
-        if not (b & 0x80):
-            break
-    length = 0
-    shift = 0
-    for b in len_bytes:
-        length |= (b << shift)
-        shift += 7
-    str_bytes = byte_str[i:i + length]  # выделяем байты, соответствующие длине строки
-    string = str_bytes.decode()  # декодируем байты в строку
-    return string  # выводим строку на экран
-
-
 def triggers(stream: BytesIO, byte: int | bytes):
     result = []
     length = read_uleb128(stream)
