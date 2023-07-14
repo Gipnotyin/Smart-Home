@@ -1,48 +1,78 @@
 import sys
+from dataclasses import dataclass
+from enum import Enum
+from typing import Any, Union
+
 import requests
 import base64
 from functools import reduce
-from io import BytesIO
+
+BROADCAST = 0x3FFF
+
+
+class DeviceType(Enum):
+    SmartHub = 0x01  # this
+    EnvSensor = 0x02  # датчик
+    Switch = 0x03  # переключатель
+    Lamp = 0x04  # лампа
+    Socket = 0x05  # розетка;
+    Clock = 0x06  # часы
+
+
+class Command(Enum):
+    WhoIsHere = 0x01
+    IAmHere = 0x02
+    GetStatus = 0x03
+    Status = 0x04
+    SetStatus = 0x05
+    Tick = 0x06
+
+
+@dataclass
+class DeviceTypeBody:
+    dev_type: DeviceType
+    dev_name: str
+    dev_props: Union[None, list[str], Any]
+
+
+@dataclass
+class Lamp:
+    name: str
+    address: int
+    status: int
+
+
+@dataclass
+class Switch:
+    name: str
+    address: int
+    status: int
+    devices: list[str]
+
+
+@dataclass
+class Payload:
+    src: int
+    dst: int
+    dev_type: DeviceType
+    cmd: Command
+    cmd_body: Union[None, DeviceTypeBody, bytes]
+    serial: int = 0
+
+
+@dataclass
+class Packet:
+    length: int
+    payload: Payload
+    crc8: int
 
 
 # Функция для вычисления контрольной суммы CRC-8
 def crc8(payload):
-    crc_lookup = [
-        0, 29, 58, 39, 116, 105, 78, 83, 232, 245, 210, 207, 156, 129, 166, 187,
-        205, 208, 247, 234, 185, 164, 131, 158, 37, 56, 31, 2, 81, 76, 107, 118,
-        135, 154, 189, 160, 243, 238, 201, 212, 111, 114, 85, 72, 27, 6, 33, 60,
-        74, 87, 112, 109, 62, 35, 4, 25, 162, 191, 152, 133, 214, 203, 236, 241,
-        19, 14, 41, 52, 103, 122, 93, 64, 251, 230, 193, 220, 143, 146, 181, 168,
-        222, 195, 228, 249, 170, 183, 144, 141, 54, 43, 12, 17, 66, 95, 120, 101,
-        148, 137, 174, 179, 224, 253, 218, 199, 124, 97, 70, 91, 8, 21, 50, 47,
-        89, 68, 99, 126, 45, 48, 23, 10, 177, 172, 139, 150, 197, 216, 255, 226,
-        38, 59, 28, 1, 82, 79, 104, 117, 206, 211, 244, 233, 186, 167, 128, 157,
-        235, 246, 209, 204, 159, 130, 165, 184, 3, 30, 57, 36, 119, 106, 77, 80,
-        161, 188, 155, 134, 213, 200, 239, 242, 73, 84, 115, 110, 61, 32, 7, 26,
-        108, 113, 86, 75, 24, 5, 34, 63, 132, 153, 190, 163, 240, 237, 202, 215,
-        53, 40, 15, 18, 65, 92, 123, 102, 221, 192, 231, 250, 169, 180, 147, 142,
-        248, 229, 194, 223, 140, 145, 182, 171, 16, 13, 42, 55, 100, 121, 94, 67,
-        178, 175, 136, 149, 198, 219, 252, 225, 90, 71, 96, 125, 46, 51, 20, 9,
-        127, 98, 69, 88, 11, 22, 49, 44, 151, 138, 173, 176, 227, 254, 217, 196]
-    CRC8 = lambda bytes: reduce(lambda a, x: crc_lookup[a ^ x], bytes, 0)
+    CRC8_byte = lambda byte, poly=0x1d: reduce(lambda b, _: b << 1 ^ (b & 0x80 and poly), range(8), byte) & 0xff
+    CRC8_lookup = list(map(CRC8_byte, range(256)))
+    CRC8 = lambda bytes: reduce(lambda c, b: CRC8_lookup[c ^ b], bytes, 0)
     return CRC8(payload)
-
-
-def size_address():
-    address = int(sys.argv[2])
-    varuint_address = []
-    while True:
-        byte = address & 0x7F
-        address >>= 7
-        if address:
-            byte |= 0x80
-            varuint_address.append(byte)
-        if not address:
-            break
-
-    varuint_address.reverse()
-    print(varuint_address)
-    return len(varuint_address)
 
 
 def decode_base64(data):
@@ -53,128 +83,100 @@ def encode_base64(data):
     return base64.urlsafe_b64encode(data)
 
 
-def read_uleb128(value: BytesIO):
-    result, offset, byte = 0, 0, 0x80
-    while byte & 0x80:
-        byte = value.read(1)[0]
-        result |= (byte & 0x7f) << offset
-        offset += 7
-    return result
+def read_string(data: bytes, offset: int):
+    length = data[offset]
+    offset += 1
+    return bytes.decode(data[offset:offset + length]), offset + length
 
 
-def triggers(stream: BytesIO, byte: int | bytes):
-    result = []
-    length = read_uleb128(stream)
-    for _ in range(length):
-        result.append({
-            "op": read_uleb128(stream),
-            "value": read_uleb128(stream),
-            "name": read_string(stream)
-        })
-    return result
+def decode_packet(data) -> list[Payload]:
+    data = decode_base64(data)
+    offset = 0
+    packets = []
+    while offset < len(data):
+        packet_size, offset = read_uleb128(data, offset)
+        packet_offset = offset
+        crc = data[offset + packet_size]
+        offset += packet_size + 1
+        if crc != crc8(data[packet_offset:packet_offset + packet_size]):
+            continue
+
+        src, packet_offset = read_uleb128(data, packet_offset)
+        dst, packet_offset = read_uleb128(data, packet_offset)
+        serial, packet_offset = read_uleb128(data, packet_offset)
+        dev_type = DeviceType(data[packet_offset])
+        packet_offset += 1
+        cmd = Command(data[packet_offset])
+        packet_offset += 1
+        try:
+            cmd_body = cmd_body_parse(dev_type, cmd, data, packet_offset)
+        except NotImplementedError as e:
+            cmd_body = None
+
+        # Формируем декодированный пакет
+        packets.append(Payload(
+            src=src,
+            dst=dst,
+            serial=serial,
+            dev_type=dev_type,
+            cmd=cmd,
+            cmd_body=cmd_body
+        ))
+    return packets
 
 
-def read_string(stream: BytesIO):
-    length = stream.read(1)[0]
-    if length < 1:
-        exit(99)
-    return stream.read(length).decode('ascii')
-
-
-def cmd_body_parse(dev_type: int | bytes, cmd: int | bytes, stream: BytesIO):
-    if (dev_type == 0x01 or dev_type == 0x05) and (cmd == 0x01 or cmd == 0x02): #SmartHub, WHOISHERE (1, 1) | SmartHub, IAMHERE (1, 2) | Socket, WHOISHERE (5, 1) | Socket, IAMHERE (5, 2)
-        return {
-            "dev_name": read_string(stream)
-        }
-    elif dev_type == 0x02 and (cmd == 0x01 or cmd == 0x02): #EnvSensor, WHOISHERE (2, 1) | EnvSensor, IAMHERE (2, 2)
-        dev_name = read_string(stream)
-        sensors = read_uleb128(stream)
-        return {
-            "dev_name": dev_name,
-            "dev_props": {
-                "sensors": sensors,
-                "triggers": [] if sensors == 0 else triggers(stream, sensors)
-            }
-        }
-    elif (dev_type == 0x02 or dev_type == 0x04 or dev_type == 0x03 or dev_type == 0x05) and cmd == 0x03: #EnvSensor, GETSTATUS  (2, 3) | Switch, GETSTATUS (3, 3) | Lamp, GETSTATUS (4, 3) | Socket, GETSTATUS (5, 3)
-        return None
-    elif dev_type == 0x02 and cmd == 0x04: #EnvSensor, STATUS  (2, 4)
-        length = read_uleb128(stream)
-        return {
-            "values": [read_uleb128(stream) for _ in range(length)]
-        }
-    elif dev_type == 0x03 and (cmd == 0x01 or cmd == 0x02): #Switch, WHOISHERE (3, 1) | Switch, IAMHERE (3, 2)
-        dev_name = read_string(stream)
-        length = read_uleb128(stream)
-        return {
-            "dev_name": dev_name,
-            "dev_props": {
-                "dev_names": [read_string(stream) for _ in range(length)]
-            }
-        }
-    elif (dev_type == 0x03 or dev_type == 0x04 or dev_type == 0x05) and cmd == 0x04 \
-            or (dev_type == 0x04 or dev_type == 0x05) and cmd == 0x05: #Switch, STATUS (3, 4) | Lamp, STATUS (4, 4) | #Lamp, SETSTATUS (4, 5) | Socket, SETSTATUS (5, 5)
-        return {
-            "value": read_uleb128(stream)
-        }
-    elif dev_type == 0x04 and (cmd == 0x01 or cmd == 0x02): #Lamp, WHOISHERE (4, 1) | Lamp, IAMHERE (4, 2)
-        return {
-            "dev_name": read_string(stream)
-        }
-    elif dev_type == 0x06 and (cmd == 0x02 or cmd == 0x01):
-        return {
-            "dev_name": read_string(stream)
-        }
-    elif dev_type == 0x06 and cmd == 0x06:
-        return {
-            "timestamp": read_uleb128(stream)
-        }
-    else:
-        exit(99)
-
-
-def decode_packet(length, data: int | bytes):
-    stream = BytesIO(data)
-    packet_size = length
-    packet_data = stream.read(packet_size+1)
-    src8 = packet_data[-1]
-    stream.seek(0)
-    if crc8(packet_data[:-1]) != src8:
-        # Контрольная сумма не совпадает, возвращаем None
-        return None
-
-    src = read_uleb128(stream)
-    dst = read_uleb128(stream)
-    serial = read_uleb128(stream)
-    dev_type = read_uleb128(stream)
-    cmd = read_uleb128(stream)
-    cmd_body = cmd_body_parse(dev_type, cmd, stream)
-    # Формируем декодированный пакет
-    decoded_packet = {
-        'src': src,
-        'dst': dst,
-        'serial': serial,
-        'dev_type': dev_type,
-        'cmd': cmd,
-        'cmd_body': cmd_body
-    }
-    if decoded_packet['cmd_body'] is None:
-        del decoded_packet['cmd_body']
-    return decoded_packet
-
-
-def string_to_ULEB128(string: str):
-    length = len(string.encode())  # вычисляем длину строки в байтах
-    len_bytes = []
-    while True:
-        b = length & 0x7f
-        length >>= 7
-        if length:
-            len_bytes.append(b | 0x80)
+def cmd_body_parse(dev_type: DeviceType, cmd: Command, data: bytes, offset: int) -> Union[None, DeviceTypeBody, int]:
+    if dev_type == DeviceType.Clock:
+        if cmd == Command.WhoIsHere:
+            return dev_type_body_parse(dev_type, data, offset)
+        elif cmd == Command.IAmHere:
+            return dev_type_body_parse(dev_type, data, offset)
+        elif cmd == Command.Tick:
+            return read_uleb128(data, offset)[0]
+    elif dev_type == DeviceType.Lamp:
+        if cmd == Command.IAmHere:
+            return dev_type_body_parse(dev_type, data, offset)
+        elif cmd == Command.Status:
+            return data[offset]
         else:
-            len_bytes.append(b)
+            raise NotImplementedError(dev_type, cmd)
+    elif dev_type == DeviceType.Switch:
+        if cmd == Command.IAmHere:
+            return dev_type_body_parse(dev_type, data, offset)
+        elif cmd == Command.Status:
+            return data[offset]
+        else:
+            raise NotImplementedError(dev_type, cmd)
+    else:
+        raise NotImplementedError(dev_type, cmd)
+
+
+def dev_type_body_parse(dev_type: DeviceType, data: bytes, offset: int):
+    if dev_type in [DeviceType.SmartHub, DeviceType.Clock, DeviceType.Lamp]:
+        return DeviceTypeBody(dev_type=dev_type, dev_name=read_string(data, offset)[0], dev_props=None)
+    elif dev_type == DeviceType.Switch:
+        dev_name, offset = read_string(data, offset)
+        length = data[offset]
+        offset += 1
+        dev_props = []
+        for _ in range(length):
+            name, offset = read_uleb128(data, offset)
+            dev_props.append(name)
+        return DeviceTypeBody(dev_type=dev_type, dev_name=dev_name, dev_props=dev_props)
+    else:
+        raise NotImplementedError(dev_type)
+
+
+def read_uleb128(data: bytes, offset: int):
+    result = 0
+    shift = 0
+    while True:
+        result |= (data[offset] & 0x7F) << shift
+        if data[offset] & 0x80 == 0:
             break
-    return bytes(len_bytes) + string.encode()  # кодируем строку в байты
+        offset += 1
+        shift += 7
+    return result, offset + 1
 
 
 def encode_uleb128(value):
@@ -190,85 +192,152 @@ def encode_uleb128(value):
     return bytes(result)
 
 
-def encode_payload(struct: dict):
-    result = []
-    for key, val in struct.items():
-        if isinstance(val, dict):
-            result.extend(encode_payload(val))
-        if isinstance(val, list):
-            result.extend(encode_uleb128(len(val)))
-            for v in val:
-                if isinstance(v, dict):
-                    result.extend(encode_payload(v))
-                if isinstance(v, str):
-                    result.extend(string_to_ULEB128(v))
-                if isinstance(v, int):
-                    result.extend(encode_uleb128(v))
-        if isinstance(val, int):
-            result.extend(encode_uleb128(val))
-        if isinstance(val, str):
-            result.extend(string_to_ULEB128(val))
-    return result
-
-
-def encode_packet(packet):
-    CRC8_byte = lambda byte, poly=0x1d: reduce(lambda b, _: b << 1 ^ (b & 0x80 and poly), range(8), byte) & 0xff
-    CRC8_lookup = list(map(CRC8_byte, range(256)))
-    CRC8 = lambda bytes: reduce(lambda c, b: CRC8_lookup[c ^ b], bytes, 0)
-    pack = lambda payload: [len(payload), *payload, CRC8(payload)]
+def encode_packet(payload: Payload):
+    payload = \
+        [
+            *encode_uleb128(payload.src),
+            *encode_uleb128(payload.dst),
+            *encode_uleb128(payload.serial),
+            payload.dev_type.value,
+            payload.cmd.value,
+            *cmd_body_dump(payload.cmd_body),
+        ]
+    pack = lambda payload: [len(payload), *payload, crc8(payload)]
     b64encode = lambda payload: base64.urlsafe_b64encode(bytearray(pack(payload))).decode('ascii').rstrip('=')
-
-    payload = encode_payload(packet)
 
     return b64encode(payload)
 
 
-def language(bin_str: int | bytes):
-    data = BytesIO(bin_str)
-    while True:
-        try:
-            length = read_uleb128(data)
-            if length:
-                print(decode_packet(length, data.read(length+1)))
+def cmd_body_dump(cmd_body: Union[None, DeviceTypeBody, Any]):
+    if cmd_body is None:
+        return bytes()
+    elif type(cmd_body) == bytes:
+        return cmd_body
+    elif type(cmd_body) in [DeviceTypeBody]:
+        return dev_type_body_dump(cmd_body)
+    else:
+        raise NotImplementedError(type(cmd_body))
+
+
+def dev_type_body_dump(dev_type_body: DeviceTypeBody):
+    if dev_type_body.dev_props is None:
+        result = bytearray()
+        result.append(len(dev_type_body.dev_name))
+        for c in dev_type_body.dev_name:
+            result.append(ord(c))
+        return bytes(result)
+
+
+class SmartHub:
+    def __init__(self, url, address, name):
+        self.url = url
+        self.address = int(address, base=16)
+        self.name = name
+        self.serial = 0
+        self.lamps = {}
+        self.switches = {}
+        self.local_time = 0
+
+    def send(self, payload: Payload) -> list[Payload]:
+        self.serial += 1
+        payload.serial = self.serial
+        r = requests.post(self.url, data=encode_packet(payload))
+        if r.status_code not in [200, 204]:
+            exit(99)
+        if r.status_code == 204:
+            exit(0)
+
+        return self.remove_ticks(decode_packet(r.text))
+
+    def remove_ticks(self, payloads):
+        cleared = []
+        for p in payloads:
+            if p.cmd == Command.Tick:
+                self.local_time = p.cmd_body
             else:
-                break
-        except Exception:
-            break
+                cleared.append(p)
+        return cleared
+
+    def update(self):
+        whoishere = Payload(
+            src=self.address,
+            dst=BROADCAST,
+            dev_type=DeviceType.SmartHub,
+            cmd=Command.WhoIsHere,
+            cmd_body=DeviceTypeBody(
+                dev_type=DeviceType.SmartHub,
+                dev_name=self.name,
+                dev_props=None
+            )
+        )
+        payloads = self.send(whoishere)
+        for p in payloads:
+            if p.cmd == Command.IAmHere:
+                if p.dev_type == DeviceType.Lamp:
+                    self.lamps[p.cmd_body.dev_name] = Lamp(name=p.cmd_body.dev_name, address=p.src, status=0)
+                elif p.dev_type == DeviceType.Switch:
+                    self.switches[p.cmd_body.dev_name] = Switch(name=p.cmd_body.dev_name, address=p.src, status=0, devices=p.cmd_body.dev_props)
+        self.update_devices()
+
+    def update_devices(self):
+        for name, switch in self.switches.items():
+            getstatus = Payload(
+                src=self.address,
+                dst=switch.address,
+                dev_type=DeviceType.SmartHub,
+                cmd=Command.GetStatus,
+                cmd_body=None
+            )
+            response = self.send(getstatus)
+            response = self.send(getstatus)
+            status = None
+            for r in response:
+                if r.src == switch.address and r.cmd == Command.Status:
+                    status = r.cmd_body
+            if status is not None:
+                switch.status = status
+
+        for name, lamp in self.lamps.items():
+            getstatus = Payload(
+                src=self.address,
+                dst=lamp.address,
+                dev_type=DeviceType.SmartHub,
+                cmd=Command.GetStatus,
+                cmd_body=None
+            )
+            response = self.send(getstatus)
+            response = self.send(getstatus)
+            status = None
+            for r in response:
+                if r.src == lamp.address and r.cmd == Command.Status:
+                    status = r.cmd_body
+            if status is not None:
+                lamp.status = status
+
+        for switch in self.switches.values():
+            for device in switch.devices:
+                if device in self.lamps and self.lamps[device].status != switch.status:
+                    self.lamps[device].status = switch.status
+                    setstatus = Payload(
+                        src=self.address,
+                        dst=self.lamps[device].address,
+                        dev_type=DeviceType.SmartHub,
+                        cmd=Command.SetStatus,
+                        cmd_body=None
+                    )
+                    response = self.send(setstatus)
+                    response = self.send(setstatus)
 
 
 def main():
-    url, address = sys.argv[1:]
-    req_url = encode_packet({
-        "payload": {
-            "src": int(sys.argv[2], 16),
-            "dst": 16383,
-            "serial": 0,
-            "dev_type": 1,
-            "cmd": 1,
-            "cmd_body":
-                {
-                    "dev_name": "SMARTHUB01"
-                }
-        }
-    })
-    response = requests.post(url, req_url)
-    count = 0
-    while count < 10:
-        if response.status_code == 200:
-            if response.text != '':
-                decod_str = decode_base64(response.text)
-                print(decod_str)
-                language(decod_str)
-        elif response.status_code == 204:
-            print("exit 0")
-            exit(0)
-        else:
-            print('popusk')
-            exit(99)
-        response = requests.post(url, '')
-        count += 1
+    hub = SmartHub(sys.argv[1], sys.argv[2], 'SmartHub')
+    while True:
+        hub.update()
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except Exception as ex:
+        exit(99)
 
