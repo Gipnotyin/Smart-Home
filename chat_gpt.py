@@ -224,6 +224,7 @@ class Solution:
         self.Sockets: dict = dict()
         self.Tick: dict = dict()
         self.device_switch: dict = dict()
+        self.time: dict = dict()
         self.local_time: int = 0
         self.first_time: int = 0
 
@@ -310,12 +311,14 @@ class Solution:
             elif cmd == Command.WhoIsHere:
                 self.who_is_here_device(packet, dev_type)
             elif cmd == Command.IAmHere:
-                name = packet['cmd_body']['dev_name']
                 if abs(self.first_time - self.local_time) <= 300:
                     self.cmd_im_here(packet, dev_type)
                 else:
-                    self.black_list.add(name)
+                    self.black_list.add(packet['src'])
             elif cmd == Command.Status:
+                if abs(self.time[packet['src']] - self.local_time) > 300:
+                    self.black_list.add(packet['src'])
+                    continue
                 if dev_type == DeviceType.Switch:
                     self.switch_processing(packet)
                 elif dev_type == DeviceType.EnvSensor:
@@ -343,8 +346,8 @@ class Solution:
 
     def who_is_here_device(self, packet, dev_type):
         name = packet['cmd_body']['dev_name']
-        if name in self.black_list:
-            self.black_list.discard(name)
+        if packet['src'] in self.black_list:
+            self.black_list.discard(packet['src'])
         if dev_type == DeviceType.EnvSensor:
             self.Env_Sensors[packet['src']] = [packet, self.local_time]
         elif dev_type == DeviceType.Switch:
@@ -365,7 +368,7 @@ class Solution:
                 "cmd": Command.GetStatus
             })
         response = requests.post(self.url, data=get_status)
-        self.Switches[packet["cmd_body"]['dev_name']][1] = self.local_time
+        self.time[packet['src']] = self.local_time
         if response.status_code == 200:
             answer = self.language(decode_base64(response.text))
             for pac in answer:
@@ -384,9 +387,10 @@ class Solution:
 
     def SET_STATUS(self, packet, STATUS):
         if STATUS == 0:
-            self.black_list.add(packet['cmd_body']['dev_name'])
+            self.black_list.add(packet['src'])
         else:
-            self.black_list.discard(packet['cmd_body']['dev_name'])
+            self.black_list.discard(packet['src'])
+        self.time[packet['src']] = self.local_time
         self.serial += 1
         set_status = encode_packet(
             {
