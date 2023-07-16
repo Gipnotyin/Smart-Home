@@ -1,6 +1,4 @@
-
 import sys
-from enum import Enum
 
 import requests
 import base64
